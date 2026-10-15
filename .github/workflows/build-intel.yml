@@ -1,0 +1,29 @@
+name: Build Intel Mac App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build for Intel (x86_64)
+        run: |
+          xcodebuild -project Compositor.xcodeproj \
+            -scheme Compositor \
+            -configuration Release \
+            -derivedDataPath build \
+            ARCHS="x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload Compiled App
+        uses: actions/upload-artifact@v4
+        with:
+          name: Compositor-Intel-App
+          path: build/Build/Products/Release/Compositor.app
