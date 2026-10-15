@@ -1,4 +1,4 @@
-name: Build Intel Mac App
+name: Build Intel Mac App (macOS 14 Full Compatibility)
 
 on:
   workflow_dispatch:
@@ -15,26 +15,13 @@ jobs:
       - name: Select Latest Xcode
         run: |
           LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Using Xcode: $LATEST_XCODE"
           sudo xcode-select -s "$LATEST_XCODE"
           xcodebuild -version
-
-      - name: Build Compatibility Shim for macOS 14
-        run: |
-          cat << 'EOF' > shim.m
-          #import <AppKit/AppKit.h>
-          __attribute__((visibility("default")))
-          id $sSo8NSCursorC6AppKitE11frameResize8position10directionsABSo0a5FrameE8PositionV_AbCE0hE9DirectionO3SetVtFZ(long pos, long dirs) {
-              return [NSCursor crosshairCursor];
-          }
-          EOF
-          clang -dynamiclib -arch x86_64 -mmacosx-version-min=14.0 -framework AppKit \
-            -Wl,-install_name,@executable_path/libCompatShim.dylib \
-            shim.m -o libCompatShim.dylib
 
       - name: Build for Intel (x86_64)
         run: |
           SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
-          SHIM_PATH="$(pwd)/libCompatShim.dylib"
           xcodebuild -project Compositor.xcodeproj \
             -scheme Compositor \
             -configuration Release \
@@ -45,25 +32,108 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             MACOSX_DEPLOYMENT_TARGET="$SDK_VER" \
             OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking' \
-            OTHER_LDFLAGS="\$(inherited) \"$SHIM_PATH\" -Wl,-weak-lswiftSynchronization" \
+            OTHER_LDFLAGS='$(inherited) -Wl,-flat_namespace -Wl,-undefined,dynamic_lookup -Wl,-weak-lswiftSynchronization' \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Package App for macOS 14.0
+      - name: Auto-Generate Shim & Patch Binary for macOS 14.0
         run: |
           TARGET_OS="14.0"
           APP_PATH="$(pwd)/build/Build/Products/Release/Compositor.app"
           BIN_PATH="$APP_PATH/Contents/MacOS/Compositor"
+          SHIM_PATH="$APP_PATH/Contents/MacOS/libCompatShim.dylib"
           SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
 
-          # 1. 複製補丁動態庫到 App 內部
-          cp libCompatShim.dylib "$APP_PATH/Contents/MacOS/"
+          # 1. 編寫 Python 腳本：自動掃描執行檔中所有未定義的新版符號並生成 shim.m
+          cat << 'EOF' > gen_shim.py
+          import subprocess, sys, struct
 
-          # 2. 將 Mach-O 最低版本設為 14.0
+          bin_path = sys.argv[1]
+          out = subprocess.check_output(["nm", "-u", bin_path], text=True)
+          undef_syms = [line.strip().lstrip("_") for line in out.splitlines() if line.strip()]
+
+          # 自動捕獲所有與 FrameResize、Synchronization、Mutex、Atomic 相關的新版符號
+          keywords = ("FrameResize", "frameResize", "Synchronization", "Mutex", "Atomic", "wiggle", "bounce", "breathe")
+          target_syms = [s for s in undef_syms if any(k in s for k in keywords)]
+
+          # 保底加入已知的 NSCursor.frameResize 家族符號
+          extra_syms = [
+              "$sSo8NSCursorC6AppKitE11frameResize8position10directionsABSo0a5FrameE8PositionV_AbCE0hE9DirectionO3SetVtFZ",
+              "$sSo8NSCursorC6AppKitE20FrameResizeDirectionO3SetV6inwardAGvgZ",
+              "$sSo8NSCursorC6AppKitE20FrameResizeDirectionO3SetV7outwardAGvgZ",
+              "$sSo8NSCursorC6AppKitE20FrameResizeDirectionO3SetV3allAGvgZ",
+              "$sSo8NSCursorC6AppKitE20FrameResizeDirectionO3SetVMa",
+              "$sSo8NSCursorC6AppKitE20FrameResizeDirectionO3SetV8rawValueAGSi_tcfC",
+              "$sSo8NSCursorC6AppKitE20FrameResizeDirectionO3SetVSis10SetAlgebraAAMc"
+          ]
+          all_syms = sorted(set(target_syms + extra_syms))
+          print(f"Found {len(all_syms)} symbols to shim:")
+          for s in all_syms:
+              print("  ->", s)
+
+          with open("shim.m", "w") as f:
+              f.write("#import <AppKit/AppKit.h>\n")
+              for i, s in enumerate(all_syms):
+                  if "frameResize8position" in s:
+                      f.write(f'__attribute__((visibility("default"))) id sym_{i}(long a, long b) __asm__("_{s}");\n')
+                      f.write(f'id sym_{i}(long a, long b) {{ return [NSCursor crosshairCursor]; }}\n')
+                  else:
+                      f.write(f'__attribute__((visibility("default"))) long sym_{i}(void) __asm__("_{s}");\n')
+                      f.write(f'long sym_{i}(void) {{ return 0; }}\n')
+          EOF
+
+          python3 gen_shim.py "$BIN_PATH"
+
+          # 2. 編譯 libCompatShim.dylib 並直接放入 App 執行檔目錄
+          clang -dynamiclib -arch x86_64 -mmacosx-version-min=14.0 -framework AppKit \
+            -Wl,-install_name,@executable_path/libCompatShim.dylib \
+            shim.m -o "$SHIM_PATH"
+
+          # 3. 將 Mach-O 最低系統版本標頭改為 14.0
           vtool -set-build-version macos "$TARGET_OS" "$SDK_VER" -replace -output "$BIN_PATH" "$BIN_PATH"
 
-          # 3. 更新 Info.plist 並簽名封裝
+          # 4. 修改 Mach-O 啟用 Flat Namespace (MH_FORCE_FLAT)，將所有系統庫轉為 Weak Link，並注入 libCompatShim.dylib
+          cat << 'EOF' > patch_macho.py
+          import struct, sys
+
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              data = bytearray(f.read())
+
+          # 清除 MH_TWOLEVEL (0x80) 並加上 MH_FORCE_FLAT (0x100)，讓 dyld 跨庫尋找補丁符號
+          flags = struct.unpack("<I", data[24:28])[0]
+          flags = (flags & ~0x80) | 0x100
+          struct.pack_into("<I", data, 24, flags)
+
+          ncmds = struct.unpack("<I", data[16:20])[0]
+          offset = 32
+          injected = False
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack("<II", data[offset:offset+8])
+              if cmd in (0x0c, 0x80000018):
+                  str_off = struct.unpack("<I", data[offset+8:offset+12])[0]
+                  end = data.find(b"\x00", offset + str_off)
+                  name = data[offset+str_off:end].decode("utf-8", "ignore")
+                  # 將不再需要的 libswiftSynchronization 槽位直接替換為我們的萬用補丁庫 libCompatShim.dylib
+                  if "Synchronization" in name and not injected:
+                      new_name = b"@executable_path/libCompatShim.dylib\x00"
+                      if len(new_name) <= cmdsize - str_off:
+                          struct.pack_into("<I", data, offset, 0x0c) # 強制載入補丁庫
+                          data[offset+str_off:offset+str_off+len(new_name)] = new_name
+                          injected = True
+                          print("Replaced Synchronization dylib slot with @executable_path/libCompatShim.dylib")
+                  elif name.startswith("/System/") or name.startswith("/usr/lib/"):
+                      struct.pack_into("<I", data, offset, 0x80000018) # LC_LOAD_WEAK_DYLIB
+              offset += cmdsize
+
+          with open(path, "wb") as f:
+              f.write(data)
+          EOF
+
+          python3 patch_macho.py "$BIN_PATH"
+
+          # 5. 更新 Info.plist 最低版本要求、賦予執行權限、完成 Ad-hoc 簽名並打包
           plutil -replace LSMinimumSystemVersion -string "$TARGET_OS" "$APP_PATH/Contents/Info.plist"
           chmod +x "$APP_PATH/Contents/MacOS/"*
           codesign --force --deep --sign - "$APP_PATH"
