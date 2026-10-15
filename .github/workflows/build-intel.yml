@@ -53,9 +53,8 @@ jobs:
       - name: Package App for macOS 14.0
         run: |
           TARGET_OS="14.0"
-          APP_PATH=$(find build/Build/Products/Release -name "*.app" -maxdepth 1 | head -n 1)
-          BIN_NAME=$(defaults read "$APP_PATH/Contents/Info.plist" CFBundleExecutable)
-          BIN_PATH="$APP_PATH/Contents/MacOS/$BIN_NAME"
+          APP_PATH="$(pwd)/build/Build/Products/Release/Compositor.app"
+          BIN_PATH="$APP_PATH/Contents/MacOS/Compositor"
           SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
 
           # 1. 複製補丁動態庫到 App 內部
