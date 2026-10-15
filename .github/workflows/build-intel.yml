@@ -9,6 +9,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          repository: robbietilton/Compositor
 
       - name: Patch Minimum System Version in Project & Info.plist
         run: |
