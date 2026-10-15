@@ -12,35 +12,53 @@ jobs:
         with:
           repository: robbietilton/Compositor
 
-      - name: Patch Minimum System Version in Project & Info.plist
+      - name: Select Latest Xcode on Runner
         run: |
-          # 1. 將專案設定檔中的所有系統版本要求強制改為 13.0
-          sed -i '' 's/MACOSX_DEPLOYMENT_TARGET = [0-9.]*;/MACOSX_DEPLOYMENT_TARGET = 13.0;/g' Compositor.xcodeproj/project.pbxproj
-          # 2. 如果專案內有實體的 Info.plist，也一併修改 LSMinimumSystemVersion
-          find . -name "Info.plist" -exec plutil -replace LSMinimumSystemVersion -string "13.0" {} + 2>/dev/null || true
+          # 自動選取雲端虛擬機上最新版本的 Xcode
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Using Xcode: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE"
+          xcodebuild -version
+
+      - name: Patch Project to match Runner SDK (Avoid Swift Availability Errors)
+        run: |
+          # 取得當前雲端 Xcode 支援的最高 macOS SDK 版本（避免硬降到 13.0 導致語法報錯）
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          echo "Runner macOS SDK Version: $SDK_VER"
+          sed -i '' "s/MACOSX_DEPLOYMENT_TARGET = [0-9.]*;/MACOSX_DEPLOYMENT_TARGET = $SDK_VER;/g" Compositor.xcodeproj/project.pbxproj
 
       - name: Build for Intel (x86_64)
         run: |
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
           xcodebuild -project Compositor.xcodeproj \
             -scheme Compositor \
             -configuration Release \
             -derivedDataPath build \
             ARCHS="x86_64" \
             ONLY_ACTIVE_ARCH=NO \
-            MACOSX_DEPLOYMENT_TARGET="13.0" \
+            MACOSX_DEPLOYMENT_TARGET="$SDK_VER" \
+            OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking' \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Fix Info.plist, Sign, and Package App Properly
+      - name: Patch Binary Header & Info.plist for Older macOS
         run: |
+          # 設定你要相容的目標 macOS 版本（例如 14.0 或 15.0）
+          TARGET_OS="14.0"
           APP_PATH="build/Build/Products/Release/Compositor.app"
-          # 強制寫入編譯後 App 內的 Info.plist 最低版本為 13.0
-          plutil -replace LSMinimumSystemVersion -string "13.0" "$APP_PATH/Contents/Info.plist"
-          # 賦予執行權限並在雲端完成簽名
+          BIN_PATH="$APP_PATH/Contents/MacOS/Compositor"
+
+          # 1. 使用 Apple 原生 vtool 修改 Mach-O 執行檔內的最低系統要求標記
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          vtool -set-build-version macos "$TARGET_OS" "$SDK_VER" -replace -output "$BIN_PATH" "$BIN_PATH"
+
+          # 2. 修改 Info.plist 的最低版本限制
+          plutil -replace LSMinimumSystemVersion -string "$TARGET_OS" "$APP_PATH/Contents/Info.plist"
+
+          # 3. 賦予權限、重新進行 Ad-hoc 簽名並完整封裝
           chmod +x "$APP_PATH/Contents/MacOS/"*
           codesign --force --deep --sign - "$APP_PATH"
-          # 使用 macOS 原生 ditto 連同 .app 外殼與權限一起打包成 zip
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" Compositor-Ready.zip
 
       - name: Upload Compiled App
