@@ -1,4 +1,4 @@
-name: Build Intel Mac App (macOS 14 Sonoma Compatible)
+name: Build Intel Mac App
 
 on:
   workflow_dispatch:
@@ -12,11 +12,20 @@ jobs:
         with:
           repository: robbietilton/Compositor
 
-      - name: Select Latest Xcode
+      - name: Select Latest Xcode on Runner
         run: |
+          # 自動選取雲端虛擬機上最新版本的 Xcode
           LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Using Xcode: $LATEST_XCODE"
           sudo xcode-select -s "$LATEST_XCODE"
           xcodebuild -version
+
+      - name: Patch Project to match Runner SDK (Avoid Swift Availability Errors)
+        run: |
+          # 取得當前雲端 Xcode 支援的最高 macOS SDK 版本（避免硬降到 13.0 導致語法報錯）
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          echo "Runner macOS SDK Version: $SDK_VER"
+          sed -i '' "s/MACOSX_DEPLOYMENT_TARGET = [0-9.]*;/MACOSX_DEPLOYMENT_TARGET = $SDK_VER;/g" Compositor.xcodeproj/project.pbxproj
 
       - name: Build for Intel (x86_64)
         run: |
@@ -26,48 +35,28 @@ jobs:
             -configuration Release \
             -derivedDataPath build \
             ARCHS="x86_64" \
-            VALID_ARCHS="x86_64 arm64" \
-            EXCLUDED_ARCHS="" \
             ONLY_ACTIVE_ARCH=NO \
             MACOSX_DEPLOYMENT_TARGET="$SDK_VER" \
             OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking' \
-            OTHER_LDFLAGS='$(inherited) -Wl,-weak-lswiftSynchronization' \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Patch Binary for macOS 14.0 & Weak-Link Swift 6 Libraries
+      - name: Patch Binary Header & Info.plist for Older macOS
         run: |
+          # 設定你要相容的目標 macOS 版本（例如 14.0 或 15.0）
           TARGET_OS="14.0"
-          APP_PATH=$(find build/Build/Products/Release -name "*.app" -maxdepth 1 | head -n 1)
-          BIN_NAME=$(defaults read "$APP_PATH/Contents/Info.plist" CFBundleExecutable)
-          BIN_PATH="$APP_PATH/Contents/MacOS/$BIN_NAME"
-          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          APP_PATH="build/Build/Products/Release/Compositor.app"
+          BIN_PATH="$APP_PATH/Contents/MacOS/Compositor"
 
-          # 1. 將 Mach-O 最低版本設為 14.0
+          # 1. 使用 Apple 原生 vtool 修改 Mach-O 執行檔內的最低系統要求標記
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
           vtool -set-build-version macos "$TARGET_OS" "$SDK_VER" -replace -output "$BIN_PATH" "$BIN_PATH"
 
-          # 2. 將 libswiftSynchronization 等新版動態庫轉為 LC_LOAD_WEAK_DYLIB
-          python3 -c '
-          import struct, sys
-          path = sys.argv[1]
-          with open(path, "rb") as f: data = bytearray(f.read())
-          ncmds = struct.unpack("<I", data[16:20])[0]
-          offset = 32
-          for _ in range(ncmds):
-              cmd, cmdsize = struct.unpack("<II", data[offset:offset+8])
-              if cmd == 0x0c:
-                  str_off = struct.unpack("<I", data[offset+8:offset+12])[0]
-                  end = data.find(b"\x00", offset + str_off)
-                  name = data[offset+str_off:end].decode("utf-8", "ignore")
-                  if "Synchronization" in name:
-                      struct.pack_into("<I", data, offset, 0x80000018)
-              offset += cmdsize
-          with open(path, "wb") as f: f.write(data)
-          ' "$BIN_PATH"
-
-          # 3. 更新 Info.plist 並簽名封裝
+          # 2. 修改 Info.plist 的最低版本限制
           plutil -replace LSMinimumSystemVersion -string "$TARGET_OS" "$APP_PATH/Contents/Info.plist"
+
+          # 3. 賦予權限、重新進行 Ad-hoc 簽名並完整封裝
           chmod +x "$APP_PATH/Contents/MacOS/"*
           codesign --force --deep --sign - "$APP_PATH"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" Compositor-Ready.zip
