@@ -10,6 +10,13 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Patch Minimum System Version in Project & Info.plist
+        run: |
+          # 1. 將專案設定檔中的所有系統版本要求強制改為 13.0
+          sed -i '' 's/MACOSX_DEPLOYMENT_TARGET = [0-9.]*;/MACOSX_DEPLOYMENT_TARGET = 13.0;/g' Compositor.xcodeproj/project.pbxproj
+          # 2. 如果專案內有實體的 Info.plist，也一併修改 LSMinimumSystemVersion
+          find . -name "Info.plist" -exec plutil -replace LSMinimumSystemVersion -string "13.0" {} + 2>/dev/null || true
+
       - name: Build for Intel (x86_64)
         run: |
           xcodebuild -project Compositor.xcodeproj \
@@ -18,12 +25,24 @@ jobs:
             -derivedDataPath build \
             ARCHS="x86_64" \
             ONLY_ACTIVE_ARCH=NO \
+            MACOSX_DEPLOYMENT_TARGET="13.0" \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Fix Info.plist, Sign, and Package App Properly
+        run: |
+          APP_PATH="build/Build/Products/Release/Compositor.app"
+          # 強制寫入編譯後 App 內的 Info.plist 最低版本為 13.0
+          plutil -replace LSMinimumSystemVersion -string "13.0" "$APP_PATH/Contents/Info.plist"
+          # 賦予執行權限並在雲端完成簽名
+          chmod +x "$APP_PATH/Contents/MacOS/"*
+          codesign --force --deep --sign - "$APP_PATH"
+          # 使用 macOS 原生 ditto 連同 .app 外殼與權限一起打包成 zip
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" Compositor-Ready.zip
+
       - name: Upload Compiled App
         uses: actions/upload-artifact@v4
         with:
-          name: Compositor-Intel-App
-          path: build/Build/Products/Release/Compositor.app
+          name: Compositor-Intel-Package
+          path: Compositor-Ready.zip
