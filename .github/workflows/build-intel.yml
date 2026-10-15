@@ -1,4 +1,4 @@
-name: Build Intel Mac App (macOS 14 Sonoma Full Patch)
+name: Build Intel Mac App
 
 on:
   workflow_dispatch:
@@ -16,27 +16,25 @@ jobs:
         run: |
           LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
           sudo xcode-select -s "$LATEST_XCODE"
+          xcodebuild -version
 
-      - name: Patch macOS 15+ Exclusive APIs for macOS 14 Compatibility
+      - name: Build Compatibility Shim for macOS 14
         run: |
-          # 1. 將 macOS 15 專屬的 NSCursor.frameResize 替換為 macOS 14 支援的標準游標
-          python3 -c '
-          import glob, re
-          for p in glob.glob("**/*.swift", recursive=True):
-              with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                  c = f.read()
-              # 將 NSCursor.frameResize(...) 替換為 NSCursor.crosshair
-              new_c = re.sub(r"NSCursor\.frameResize\s*\([^)]+\)", "NSCursor.crosshair", c)
-              new_c = re.sub(r"\.frameResize\s*\(\s*position:[^)]+\)", ".crosshair", new_c)
-              if new_c != c:
-                  print("Patched NSCursor.frameResize in:", p)
-                  with open(p, "w", encoding="utf-8") as f:
-                      f.write(new_c)
-          '
+          cat << 'EOF' > shim.m
+          #import <AppKit/AppKit.h>
+          __attribute__((visibility("default")))
+          id $sSo8NSCursorC6AppKitE11frameResize8position10directionsABSo0a5FrameE8PositionV_AbCE0hE9DirectionO3SetVtFZ(long pos, long dirs) {
+              return [NSCursor crosshairCursor];
+          }
+          EOF
+          clang -dynamiclib -arch x86_64 -mmacosx-version-min=14.0 -framework AppKit \
+            -Wl,-install_name,@executable_path/libCompatShim.dylib \
+            shim.m -o libCompatShim.dylib
 
       - name: Build for Intel (x86_64)
         run: |
           SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          SHIM_PATH="$(pwd)/libCompatShim.dylib"
           xcodebuild -project Compositor.xcodeproj \
             -scheme Compositor \
             -configuration Release \
@@ -47,11 +45,12 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             MACOSX_DEPLOYMENT_TARGET="$SDK_VER" \
             OTHER_SWIFT_FLAGS='$(inherited) -Xfrontend -disable-availability-checking' \
+            OTHER_LDFLAGS="\$(inherited) \"$SHIM_PATH\" -Wl,-weak-lswiftSynchronization" \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Patch Binary for macOS 14.0 & Weak-Link All System Frameworks
+      - name: Package App for macOS 14.0
         run: |
           TARGET_OS="14.0"
           APP_PATH=$(find build/Build/Products/Release -name "*.app" -maxdepth 1 | head -n 1)
@@ -59,27 +58,11 @@ jobs:
           BIN_PATH="$APP_PATH/Contents/MacOS/$BIN_NAME"
           SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
 
-          # 1. 將 Mach-O 最低版本設為 14.0
-          vtool -set-build-version macos "$TARGET_OS" "$SDK_VER" -replace -output "$BIN_PATH" "$BIN_PATH"
+          # 1. 複製補丁動態庫到 App 內部
+          cp libCompatShim.dylib "$APP_PATH/Contents/MacOS/"
 
-          # 2. 將所有 /System 與 /usr/lib 動態庫設為 LC_LOAD_WEAK_DYLIB，防止啟動時符號缺失崩潰
-          python3 -c '
-          import struct, sys
-          path = sys.argv[1]
-          with open(path, "rb") as f: data = bytearray(f.read())
-          ncmds = struct.unpack("<I", data[16:20])[0]
-          offset = 32
-          for _ in range(ncmds):
-              cmd, cmdsize = struct.unpack("<II", data[offset:offset+8])
-              if cmd == 0x0c:
-                  str_off = struct.unpack("<I", data[offset+8:offset+12])[0]
-                  end = data.find(b"\x00", offset + str_off)
-                  name = data[offset+str_off:end].decode("utf-8", "ignore")
-                  if name.startswith("/System/") or name.startswith("/usr/lib/"):
-                      struct.pack_into("<I", data, offset, 0x80000018)
-              offset += cmdsize
-          with open(path, "wb") as f: f.write(data)
-          ' "$BIN_PATH"
+          # 2. 將 Mach-O 最低版本設為 14.0
+          vtool -set-build-version macos "$TARGET_OS" "$SDK_VER" -replace -output "$BIN_PATH" "$BIN_PATH"
 
           # 3. 更新 Info.plist 並簽名封裝
           plutil -replace LSMinimumSystemVersion -string "$TARGET_OS" "$APP_PATH/Contents/Info.plist"
